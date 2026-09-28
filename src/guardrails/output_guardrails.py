@@ -27,6 +27,36 @@ from core.utils import chat_with_agent
 # - "redacted": cleaned response (PII replaced with [REDACTED])
 # ============================================================
 
+# Thu tu quan trong: secret/password truoc, roi PII. Phone chay truoc national_id nhung
+# dung lookaround de CCCD 12 so (bat dau bang 0) khong bi nhan nham la SDT.
+PII_PATTERNS = {
+    # "password is admin123" / "password=Secret!99" / "mat khau: ..."
+    # Nhom "label" duoc giu lai, chi che gia tri: "password is [REDACTED]".
+    "password": r"(?P<label>\b(?:password|passwd|pwd|mat\s*khau|mật\s*khẩu)\s*(?:is|la|là|[:=])\s*)[^\s,;]+",
+    "api_key": r"\bsk-[a-zA-Z0-9][a-zA-Z0-9-]{5,}",
+    "internal_host": r"\b[\w.-]+\.internal(?::\d+)?\b",
+    "secret_value": r"\badmin123\b",
+    # SDT VN: 0xxxxxxxxx (10-11 so) hoac +84, cho phep dau cach/cham/gach giua cac so.
+    "phone": r"(?<![\d+])(?:\+84|0)(?:[\s.-]?\d){9,10}(?!\d)",
+    "email": r"[\w.+-]+@[\w-]+(?:\.[\w-]+)*\.[a-zA-Z]{2,}",
+    # CMND 9 so / CCCD 12 so; bo qua so tien (vd "500000000 VND").
+    "national_id": r"(?<!\d)(?:\d{12}|\d{9})(?!\d)(?!\s*(?:vnd|vnđ|đ|dong|usd))",
+}
+
+# Lien he chinh thuc cua VinBank (ground truth) - khong phai PII, duoc phep hien thi.
+OFFICIAL_CONTACTS = ("support@vinbank.example",)
+
+# Secret demo sau khi bo moi ky tu khong phai chu/so - bat ca ban bi "nguy trang"
+# nhu "s k - v i n b a n k ..." hay "admin_123".
+_OBFUSCATED_SECRETS = ("admin123", "skvinbanksecret2024", "dbvinbankinternal")
+
+
+def _redact_match(match: re.Match) -> str:
+    if match.group(0).lower() in OFFICIAL_CONTACTS:
+        return match.group(0)
+    return (match.groupdict().get("label") or "") + "[REDACTED]"
+
+
 def content_filter(response: str) -> dict:
     """Filter response for PII, secrets, and harmful content.
 
@@ -37,23 +67,23 @@ def content_filter(response: str) -> dict:
         dict with 'safe', 'issues', and 'redacted' keys
     """
     issues = []
-    redacted = response
-
-    # PII patterns to check
-    PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
-    }
+    redacted = response or ""
 
     for name, pattern in PII_PATTERNS.items():
-        matches = re.findall(pattern, response, re.IGNORECASE)
+        matches = [
+            m.group(0)
+            for m in re.finditer(pattern, redacted, re.IGNORECASE)
+            if m.group(0).lower() not in OFFICIAL_CONTACTS
+        ]
         if matches:
             issues.append(f"{name}: {len(matches)} found")
-            redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+            redacted = re.sub(pattern, _redact_match, redacted, flags=re.IGNORECASE)
+
+    # Lop cuoi: secret con sot sau regex (bi chen ky tu/khoang trang) -> fail-closed ca cau.
+    compact = re.sub(r"[^a-z0-9]", "", redacted.lower())
+    if any(secret in compact for secret in _OBFUSCATED_SECRETS):
+        issues.append("obfuscated_secret: 1 found")
+        redacted = "[REDACTED]"
 
     return {
         "safe": len(issues) == 0,
@@ -172,16 +202,29 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        # 1. Regex PII/secret -> thay bang ban da redact.
+        filtered = content_filter(response_text)
+        if not filtered["safe"]:
+            self.redacted_count += 1
+            response_text = filtered["redacted"]
+            llm_response.content = types.Content(
+                role="model", parts=[types.Part.from_text(text=response_text)]
+            )
 
-        return llm_response  # TODO: modify if needed
+        # 2. LLM-as-Judge (optional): UNSAFE -> thay ca cau bang message an toan.
+        if self.use_llm_judge:
+            judgement = await llm_safety_check(response_text)
+            if not judgement["safe"]:
+                self.blocked_count += 1
+                llm_response.content = types.Content(
+                    role="model",
+                    parts=[types.Part.from_text(
+                        text="I'm sorry, I can't share that. How else can I help with your VinBank banking needs?"
+                    )],
+                )
+
+        # 3. Tra ve response (co the da duoc sua).
+        return llm_response
 
 
 # ============================================================

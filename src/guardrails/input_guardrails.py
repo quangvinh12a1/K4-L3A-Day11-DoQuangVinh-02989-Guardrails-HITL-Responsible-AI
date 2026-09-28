@@ -11,6 +11,7 @@ Status convention (không dùng True/False mơ hồ):
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Literal
 
 from google.genai import types
@@ -42,6 +43,63 @@ InputStatus = Literal["ALLOW", "BLOCK"]
 # Regex is one signal, not the whole security boundary.
 # ============================================================
 
+# Ky tu vo hinh hay dung de "be" regex: zero-width space/joiner, BOM, soft hyphen...
+_INVISIBLE_CHARS = dict.fromkeys(
+    map(ord, "­᠎​‌‍‎‏⁠⁡⁢⁣⁤﻿"),
+    None,
+)
+
+
+def normalize_text(text: str) -> str:
+    """Chuan hoa truoc khi so khop: NFKC (full-width -> ASCII), bo ky tu vo hinh,
+    bo dau tieng Viet (d/đ), lowercase, gop khoang trang."""
+    text = unicodedata.normalize("NFKC", text or "").translate(_INVISIBLE_CHARS)
+    text = text.replace("đ", "d").replace("Đ", "D")
+    text = "".join(
+        ch for ch in unicodedata.normalize("NFD", text) if unicodedata.category(ch) != "Mn"
+    )
+    return re.sub(r"\s+", " ", text).strip().casefold()
+
+
+INJECTION_PATTERNS = [
+    # 1. Ghi de chi dan: ignore/disregard/forget/override ... instructions
+    r"\b(ignore|disregard|forget|override|bypass)\b\s+(all\s+|any\s+|the\s+|your\s+|my\s+)*"
+    r"(previous\s+|above\s+|prior\s+|earlier\s+|system\s+|safety\s+)?"
+    r"(instructions?|rules?|directives?|guidelines?|prompts?|restrictions?)",
+    # 2. Doi vai tro: you are now / from now on you are
+    r"\byou\s+are\s+now\b|\bfrom\s+now\s+on,?\s+you\s+(are|will)\b",
+    # 3. Nham vao system prompt / chi dan an
+    r"\bsystem\s+prompt\b|\b(developer|hidden|initial|internal)\s+(message|prompt|instructions?)\b",
+    # 4. Doi lo chi dan / bi mat
+    r"\b(reveal|show|print|repeat|display|leak|dump|output|tell\s+me)\b\s+(me\s+)?(your\s+|the\s+)?"
+    r"(system\s+|internal\s+|hidden\s+)?(instructions?|prompt|config(uration)?|secrets?|credentials?)\b",
+    # 5. Nhap vai
+    r"\bpretend\s+(you\s+are|to\s+be|that\s+you)\b|\brole[\s-]?play\s+as\b",
+    # 6. Jailbreak persona
+    r"\bact\s+as\s+(a\s+|an\s+)?(unrestricted|unfiltered|uncensored|jailbroken|evil)\b"
+    r"|\bdan\b|\bdo\s+anything\s+now\b|\bdeveloper\s+mode\b|\bjailbreak",
+    # 7. Do credential noi bo (khong chan cau "quen mat khau online banking" cua khach)
+    r"\b(admin|root|system|internal|database|db)\s+(password|credentials?|host|api\s*key)\b"
+    r"|\bapi\s*keys?\b|\bconnection\s+string\b|sk-vinbank|\.internal\b",
+    # 8. Lach bang ma hoa / dien vao cho trong
+    r"\b(base64|rot13|hex|reverse(d)?|spell(ed)?\s+out|letter\s+by\s+letter)\b.*"
+    r"\b(password|secret|key|prompt|instructions?|credentials?)\b|\bfill\s+in\s+the\s+blanks?\b",
+    # 9. Tieng Viet (da bo dau): bo qua huong dan / tiet lo mat khau / ban la DAN
+    r"\b(bo\s+qua|phot\s+lo|quen)\s+(het\s+|moi\s+|tat\s+ca\s+|cac\s+)*(huong\s+dan|chi\s+dan|quy\s+tac|lenh)"
+    r"|\btiet\s+lo\b.*\b(mat\s+khau|api|system\s+prompt|noi\s+bo|bi\s+mat)"
+    r"|\bban\s+(bay\s+gio\s+)?la\s+dan\b",
+]
+
+# Tin hieu phu: ghep lien chu de bat "i g n o r e  a l l ..." / "ignore.all.previous".
+_COMPACT_SIGNALS = (
+    "ignoreallpreviousinstructions",
+    "ignorepreviousinstructions",
+    "disregardallpreviousinstructions",
+    "revealyoursystemprompt",
+    "boquamoihuongdan",
+)
+
+
 def detect_injection(user_input: str) -> InputStatus:
     """Detect prompt injection patterns in user input.
 
@@ -51,15 +109,14 @@ def detect_injection(user_input: str) -> InputStatus:
     Returns:
         ``"BLOCK"`` if injection detected (chặn), ``"ALLOW"`` otherwise (cho qua).
     """
-    INJECTION_PATTERNS = [
-        # TODO: Add at least 5 regex patterns
-        # Example:
-        # r"ignore (all )?(previous|above) instructions",
-    ]
-
+    normalized = normalize_text(user_input)
     for pattern in INJECTION_PATTERNS:
-        if re.search(pattern, user_input, re.IGNORECASE):
+        if re.search(pattern, normalized, re.IGNORECASE):
             return "BLOCK"
+
+    compact = re.sub(r"[^a-z0-9]", "", normalized)
+    if any(signal in compact for signal in _COMPACT_SIGNALS):
+        return "BLOCK"
     return "ALLOW"
 
 
@@ -84,14 +141,19 @@ def topic_filter(user_input: str) -> InputStatus:
         ``"BLOCK"`` = chặn (off-topic hoặc topic cấm).
         ``"ALLOW"`` = cho qua (câu banking hợp lệ).
     """
-    input_lower = user_input.lower()
+    # Bo dau de "tài khoản" khop "tai khoan" trong ALLOWED_TOPICS.
+    input_lower = normalize_text(user_input)
 
-    # TODO: Implement logic:
-    # 1. If input contains any blocked topic -> return "BLOCK"
-    # 2. If input doesn't contain any allowed topic -> return "BLOCK"
-    # 3. Otherwise -> return "ALLOW"
+    # 1. Topic cam -> BLOCK. Dung \b de "skill" khong dinh "kill".
+    if any(re.search(rf"\b{re.escape(topic)}", input_lower) for topic in BLOCKED_TOPICS):
+        return "BLOCK"
 
-    pass  # Replace with your implementation
+    # 2. Khong co tu khoa banking nao -> BLOCK (off-topic).
+    if not any(re.search(rf"\b{re.escape(topic)}", input_lower) for topic in ALLOWED_TOPICS):
+        return "BLOCK"
+
+    # 3. Cau banking hop le.
+    return "ALLOW"
 
 
 # ============================================================
@@ -144,14 +206,24 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
         self.total_count += 1
         text = self._extract_text(user_message)
 
-        # TODO: Implement logic:
-        # 1. Call detect_injection(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 2. Call topic_filter(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 3. If both return "ALLOW": return None (let message through)
+        # 1. Prompt injection -> chan truoc khi goi LLM.
+        if detect_injection(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(
+                "Your request was blocked by VinBank security policy. "
+                "I can only help with banking questions such as accounts, transfers, savings or loans."
+            )
 
-        pass  # Replace with your implementation
+        # 2. Off-topic / topic cam.
+        if topic_filter(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(
+                "I'm the VinBank assistant and can only help with banking topics: "
+                "accounts, transactions, savings, loans, interest rates and credit cards."
+            )
+
+        # 3. Ca hai ALLOW -> cho qua LLM.
+        return None
 
 
 # ============================================================
